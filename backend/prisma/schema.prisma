@@ -1,0 +1,29 @@
+
+generator client {
+    provider = "prisma-client-js"
+}
+
+datasource db {
+    provider = "mysql"
+    url      = env("DATABASE_URL")  
+}
+
+model Document {
+    id               Int          @id @default(autoincrement())
+    userId           Int
+    originalName     String
+    storedName       String       @unique
+    mimeType         String
+    size             Int
+
+    quickFingerprint String?      @db.VarChar(64)
+    fileHash         String?      @db.VarChar(64)
+
+    status           String       @default("PENDING")
+    chunkCount       Int?
+    createdAt        DateTime     @default(now())
+    updatedAt        DateTime     @updatedAt
+
+    @@index([userId, size])
+    @@index([userId, quickFingerprint])
+}
