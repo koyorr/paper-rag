@@ -3,10 +3,25 @@ const fs = require('fs/promises');
 const path = require('path');
 const upload = require('../middleware/upload');
 const prisma = require('../prisma');
-const {ingest_Document} = require('../services/ragService');
+const {ingest_Document, delete_Documents} = require('../services/ragService');
 const router = express.Router();
 const {calculate_Quick_Finger_print,calculate_Full_Sha256} = require('../utils/fileFingerprint');
 const UPLOAD_DIR = path.resolve(__dirname,'../../uploads');
+
+/**
+ * multer/busboy 会把非 ASCII 文件名按 latin1 解码（如中文文件名变成乱码），
+ * 这里还原为正确的 UTF-8：UTF-8 字节被 latin1 解码后，再按 latin1 转回 UTF-8 即可。
+ * 若解码结果出现替换符（说明本来就是 UTF-8 明文），则原样返回。
+ */
+function decodeOriginalName(name) {
+    if (!name) return name;
+    try {
+        const decoded = Buffer.from(name, 'latin1').toString('utf8');
+        return decoded.includes('\uFFFD') ? name : decoded;
+    } catch {
+        return name;
+    }
+}
 
 router.post('/upload',upload.single('file'),async (req, res) => {
         let document = null;
@@ -14,6 +29,9 @@ router.post('/upload',upload.single('file'),async (req, res) => {
              if (!req.file) {
                 return res.status(400).json({message:'没有上传文件'});
             }
+
+            // 还原中文文件名（multer latin1 解码问题）
+            req.file.originalname = decodeOriginalName(req.file.originalname);
 
             // 现在先模拟用户,后面做好 JWT 后：const userId = req.user.id;
             const userId = Number(req.header('x-user-id'));
@@ -57,12 +75,12 @@ router.post('/upload',upload.single('file'),async (req, res) => {
 
             let currentFullHash = null;
 
-            //只有出现疑似重复才计算完整 SHA-256
-            if (fingerprintCandidates.length > 0) {
-                console.log('发现疑似重复文件，开始完整SHA-256验证...');
+            // 新上传文件总是计算完整 SHA-256（文件指纹，状态 READY 依赖它生成）
+            currentFullHash = await calculate_Full_Sha256( req.file.path );
 
-                // 新上传文件只计算一次完整SHA
-                currentFullHash = await calculate_Full_Sha256( req.file.path );
+            // 只有出现疑似重复才需要与旧文件逐个比对完整 SHA-256
+            if (fingerprintCandidates.length > 0) {
+                console.log('发现疑似重复文件，进行完整SHA-256比对...');
                 console.log('新文件 SHA-256:',currentFullHash);
 
                 // 与候选文件逐个比较
@@ -201,5 +219,159 @@ router.post('/upload',upload.single('file'),async (req, res) => {
     }
 );
 
+
+/** GET /api/documents  文档列表 */
+router.get('/', async (req, res) => {
+    try {
+        const userId = Number(req.header('x-user-id'));
+        if (!userId) {
+            return res.status(401).json({ message: '缺少 x-user-id' });
+        }
+
+        const docs = await prisma.document.findMany({
+            where: { userId },
+            orderBy: { createdAt: 'desc' }
+        });
+
+        res.json({
+            documents: docs.map((d) => ({
+                id: d.id,
+                originalName: d.originalName,
+                storedName: d.storedName,
+                mimeType: d.mimeType,
+                size: d.size,
+                status: d.status,
+                chunkCount: d.chunkCount,
+                fileHash: d.fileHash,
+                createdAt: d.createdAt,
+                uploadTime: d.createdAt.toLocaleString(
+                    'zh-CN',
+                    { timeZone: 'Asia/Shanghai', hour12: false }
+                )
+            }))
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: '获取文档列表失败', error: error.message });
+    }
+});
+
+/** GET /api/documents/:id/file  打开论文 PDF（新标签页预览） */
+router.get('/:id/file', async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        if (!id) return res.status(400).json({ message: '参数错误' });
+
+        const doc = await prisma.document.findUnique({ where: { id } });
+        if (!doc) return res.status(404).json({ message: '文档不存在' });
+
+        const filePath = path.resolve(UPLOAD_DIR, doc.storedName);
+        if (!filePath.startsWith(path.resolve(UPLOAD_DIR) + path.sep)) {
+            return res.status(400).json({ message: '非法文件路径' });
+        }
+
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader(
+            'Content-Disposition',
+            `inline; filename*=UTF-8''${encodeURIComponent(doc.originalName)}`
+        );
+        res.sendFile(filePath, (err) => {
+            if (err) {
+                console.error('打开文件失败:', err.message);
+                if (!res.headersSent) {
+                    res.status(404).json({ message: '文件不存在或已删除' });
+                }
+            }
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: '打开文件失败', error: error.message });
+    }
+});
+
+/** DELETE /api/documents/:id  删除文档：物理文件 + Chroma 向量 + MySQL 记录 */
+router.delete('/:id', async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        const userId = Number(req.header('x-user-id'));
+        if (!userId) return res.status(401).json({ message: '缺少 x-user-id' });
+        if (!id) return res.status(400).json({ message: '参数错误' });
+
+        const doc = await prisma.document.findUnique({ where: { id } });
+        if (!doc) return res.status(404).json({ message: '文档不存在' });
+
+        // 1. 删除 Chroma 向量（失败不阻断后续清理）
+        try {
+            await delete_Documents({ documentId: id, userId });
+        } catch (e) {
+            console.warn('删除向量失败（继续清理其余部分）:', e.message);
+        }
+
+        // 2. 删除 uploads 中的物理文件
+        await fs.unlink(path.join(UPLOAD_DIR, doc.storedName)).catch(() => {});
+
+        // 3. 删除 MySQL 记录
+        await prisma.document.delete({ where: { id } });
+
+        res.json({ message: '删除成功', documentId: id });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ message: '删除失败', error: error.message });
+    }
+});
+
+/** POST /api/documents/:id/reindex  重新解析入库（删旧向量 -> 重新分块向量化） */
+router.post('/:id/reindex', async (req, res) => {
+    try {
+        const id = Number(req.params.id);
+        const userId = Number(req.header('x-user-id'));
+        if (!userId) return res.status(401).json({ message: '缺少 x-user-id' });
+        if (!id) return res.status(400).json({ message: '参数错误' });
+
+        const doc = await prisma.document.findUnique({ where: { id } });
+        if (!doc) return res.status(404).json({ message: '文档不存在' });
+
+        const filePath = path.join(UPLOAD_DIR, doc.storedName);
+        await fs.access(filePath);
+
+        // 1. 删除旧向量
+        try {
+            await delete_Documents({ documentId: id, userId });
+        } catch (e) {
+            console.warn('删除旧向量失败（继续重新解析）:', e.message);
+        }
+
+        // 2. 重新分块向量化（分块参数来自前端设置请求头 x-rag-*）
+        const chunkSize = req.header('x-rag-chunk-size') || undefined;
+        const chunkOverlap = req.header('x-rag-chunk-overlap') || undefined;
+        const result = await ingest_Document({
+            documentId: id,
+            storedName: doc.storedName,
+            originalName: doc.originalName,
+            userId,
+            chunkSize,
+            chunkOverlap
+        });
+
+        // 3. 更新状态
+        await prisma.document.update({
+            where: { id },
+            data: { status: 'READY', chunkCount: result.chunks }
+        });
+
+        res.json({ message: '重新解析成功', documentId: id, chunks: result.chunks });
+    } catch (error) {
+        console.error(error);
+        // 处理失败时标记 FAILED，便于前端展示
+        try {
+            const id = Number(req.params.id);
+            await prisma.document.update({
+                where: { id },
+                data: { status: 'FAILED' }
+            }).catch(() => {});
+        } catch {}
+        res.status(500).json({ message: '重新解析失败', error: error.response?.data ?? error.message });
+    }
+});
 
 module.exports = router;

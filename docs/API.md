@@ -63,14 +63,16 @@ Content-Type: multipart/form-data
 
 重复文件返回 `409` 与 `duplicate: true`。
 
-### 3. 文档列表 / 详情 / 删除
+### 3. 文档列表 / 打开 / 删除 / 重新解析
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/documents` | 文档列表 |
-| GET | `/api/documents/:id` | 文档详情 |
-| DELETE | `/api/documents/:id` | 删除文档 |
-| POST | `/api/documents/:id/reindex` | 重新解析入库（预设） |
+| GET | `/api/documents` | 文档列表（含 fileHash / 状态 / 分块数） |
+| GET | `/api/documents/:id/file` | 打开论文 PDF（inline 预览，`%PDF` 流） |
+| DELETE | `/api/documents/:id` | 删除文档：物理文件 + Chroma 向量 + MySQL 记录 |
+| POST | `/api/documents/:id/reindex` | 重新解析入库：删除旧向量后重新分块向量化 |
+
+- 上传时**总是计算文件 SHA-256**（`fileHash`），文档状态在 `fileHash` 生成且向量化完成后才置为 `READY`
 
 ### 4. RAG 问答
 
@@ -92,21 +94,86 @@ POST /api/qa/ask
 ```json
 {
   "answer": "回答内容...",
-  "sources": [ { "document_id": 1, "source": "xxx.pdf", "page": 3 } ]
+  "sources": [ { "document_id": 1, "source": "xxx.pdf", "page": 3 } ],
+  "usage": { "input_tokens": 2635, "output_tokens": 546, "total_tokens": 3181 }
 }
 ```
 
-### 5. 通用 AI 对话（预设）
+- 检索时会自动并入主命中文档的开头几块（标题/摘要），便于回答「某某论文讲了什么」这类问题
+- `usage` 为 token 用量，前端据此记录 API 用量
+
+### 5. 流式输出（论文问答 / AI 对话）
+
+`POST /api/qa/ask` 与 `POST /api/chat` 在请求头带 `Accept: text/event-stream` 时返回 SSE 流，逐 token 输出：
+
+```
+data: {"type":"delta","content":"一段增量文本"}
+data: {"type":"sources","sources":[{...}]}      # 仅论文问答
+data: {"type":"usage","usage":{...}}
+data: {"type":"done"}
+```
+
+不带该请求头则返回原有 JSON。前端收到 `type: error` 事件表示流中出错。
+
+### 6. 语义检索
+
+```
+GET /api/qa/search?query=关键词&top_k=5
+```
+
+- `query` / `q`：检索词（必填）
+- `top_k` / `topK`：返回条数，默认 5，1–20
+
+后端转发到 RAG `/search`，只做向量检索、**不调用大模型**，返回：
+
+```json
+{
+  "results": [
+    {
+      "document_id": 3,
+      "source": "xxx.pdf",
+      "page": 2,
+      "chunk_index": 5,
+      "content": "命中片段原文...",
+      "score": 0.8234
+    }
+  ],
+  "count": 1
+}
+```
+
+### 6. 通用 AI 对话
 
 ```
 POST /api/chat
 ```
 
 ```json
-{ "message": "你好", "model": "deepseek-chat", "temperature": 0.3 }
+{
+  "message": "你好",
+  "history": [
+    { "role": "user", "content": "介绍一下 RAG" },
+    { "role": "assistant", "content": "RAG 是检索增强生成..." }
+  ],
+  "model": "deepseek-chat",
+  "temperature": 0.3
+}
 ```
 
-### 6. 配置同步
+- `history` 可选，多轮对话上下文（role: system / user / assistant）
+- `model` / `temperature` 可请求级覆盖；未传则使用运行时配置
+- API Key / Base URL 通过请求头 `x-api-key` / `x-api-url` 下发，也可在 body 传 `api_key` / `api_url`
+
+后端转发到 RAG `/chat`，返回：
+
+```json
+{
+  "message": "回答内容...",
+  "usage": { "input_tokens": 12, "output_tokens": 30, "total_tokens": 42 }
+}
+```
+
+### 7. 配置同步
 
 ```
 POST /api/config
@@ -204,7 +271,56 @@ POST /query
 - 按 `user_id` 数据隔离检索
 - `model` / `temperature` / `api_key` 可请求级覆盖；未传则使用运行时配置
 
-### 4. 配置管理
+### 4. 纯语义检索
+
+```
+POST /search
+```
+
+```json
+{ "query": "关键词", "user_id": 1, "top_k": 5 }
+```
+
+- 按 `user_id` 数据隔离检索
+- 只返回命中片段与相似度分数，不调用大模型
+
+### 5. 通用 AI 对话
+
+```
+POST /chat
+```
+
+```json
+{
+  "message": "你好",
+  "history": [ { "role": "user", "content": "介绍一下 RAG" } ],
+  "model": "deepseek-chat",
+  "temperature": 0.3,
+  "api_key": "可选覆盖",
+  "api_url": "可选覆盖"
+}
+```
+
+- 不检索知识库，直接调用配置的对话模型
+- `model` / `temperature` / `api_key` / `api_url` 可请求级覆盖；未传则使用运行时配置
+
+### 6. 删除文档向量
+
+```
+POST /delete
+```
+
+```json
+{ "user_id": 1, "document_id": 5 }
+```
+
+按 `user_id + document_id` 删除该文档在向量库中的全部块。
+
+### 7. 流式输出
+
+`POST /query` 与 `POST /chat` 在请求头带 `Accept: text/event-stream` 时返回 SSE 流（`delta` / `sources` / `usage` / `done`），否则返回 JSON。
+
+### 8. 配置管理
 
 ```
 POST /config

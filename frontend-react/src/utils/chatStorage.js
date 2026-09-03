@@ -19,7 +19,7 @@ export function addRecentSession({ mode, question, answer }) {
     const item = {
         id: crypto.randomUUID(),
         mode,
-        type: mode === "rag" ? "检索" : "AI对话",
+        type: mode === "rag" || mode === "search" ? "检索" : "AI对话",
         title: question.length > 36 ? question.slice(0, 36) + "..." : question,
         preview: answer ? answer.slice(0, 80) : "",
         createdAt: new Date().toISOString(),

@@ -1,16 +1,30 @@
 import {
     Activity,
     Coins,
-    Cpu,
+    MessageSquareText,
+    Layers,
+    Cloud,
     Zap,
     Server,
     Database,
-    KeyRound,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { getApiUsage } from "../utils/chatStorage.js";
-import { getUserConfig } from "../store/userConfig.js";
+import {
+    getUserConfig,
+    getChatConfig,
+    getEmbeddingConfig,
+} from "../store/userConfig.js";
+import { getProvider } from "../store/providerConfig.js";
 import { systemApi, userApi } from "../api/request.js";
+
+/** 厂商显示名：Ollama 时显示 "Ollama"，云端显示服务商名称 */
+function providerLabel(key) {
+    if (!key) return "未设置";
+    const label = getProvider(key)?.label;
+    if (key === "ollama") return "Ollama";
+    return label || key;
+}
 
 export default function ApiUsage() {
     const [usage, setUsage] = useState(getApiUsage());
@@ -59,9 +73,24 @@ export default function ApiUsage() {
 
             <div className="usage-grid">
                 <UsageCard
-                    icon={<Cpu />}
-                    title="当前模型"
-                    value={config.model || "未设置"}
+                    icon={<MessageSquareText />}
+                    title="对话模型"
+                    value={getChatConfig(config).model || "未设置"}
+                />
+                <UsageCard
+                    icon={<Layers />}
+                    title="嵌入模型"
+                    value={getEmbeddingConfig(config).model || "未设置"}
+                />
+                <UsageCard
+                    icon={<Cloud />}
+                    title="对话厂商"
+                    value={providerLabel(getChatConfig(config).provider)}
+                />
+                <UsageCard
+                    icon={<Cloud />}
+                    title="嵌入厂商"
+                    value={providerLabel(getEmbeddingConfig(config).provider)}
                 />
                 <UsageCard
                     icon={<Activity />}
@@ -79,11 +108,6 @@ export default function ApiUsage() {
                     value={usage.totalTokens}
                 />
                 <UsageCard
-                    icon={<KeyRound />}
-                    title="API Provider"
-                    value={config.provider || "DeepSeek"}
-                />
-                <UsageCard
                     icon={<Server />}
                     title="Express 后端"
                     value={serviceText(services.backend)}
@@ -98,7 +122,8 @@ export default function ApiUsage() {
             </div>
 
             <div className="usage-meta">
-                <span>Base URL：{config.apiUrl || "http://127.0.0.1:3000"}</span>
+                <span>对话 Base URL：{getChatConfig(config).apiUrl || "未设置"}</span>
+                <span>嵌入 Base URL：{getEmbeddingConfig(config).apiUrl || "未设置"}</span>
                 <span>User ID：{userApi.getUserId()}</span>
             </div>
         </div>

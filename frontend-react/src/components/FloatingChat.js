@@ -1,4 +1,4 @@
-import { Search, Sparkles, Send, Maximize2 } from "lucide-react";
+import { Search, Sparkles, Send, Maximize2, PanelRight } from "lucide-react";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 
@@ -34,6 +34,17 @@ export default function FloatingChat({ onOpenChat }) {
                         AI 对话
                     </button>
                 </div>
+                <button
+                    className="chat-side-btn"
+                    onClick={() => {
+                        onOpenChat({ mode, question: question.trim() });
+                        setQuestion("");
+                    }}
+                    title="在右侧打开侧边聊天"
+                >
+                    <PanelRight size={14} />
+                    侧边
+                </button>
                 <button
                     className="chat-fullscreen-btn"
                     onClick={() => navigate("/chat")}

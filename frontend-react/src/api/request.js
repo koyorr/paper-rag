@@ -73,6 +73,94 @@ function configHeaders() {
     return headers;
 }
 
+/**
+ * POST 一个 SSE 流式接口，逐事件回调 onEvent(event)。
+ * 事件形如 { type: "delta"|"sources"|"usage"|"done"|"error", ... }
+ * 抛错时带 status / message，便于上层分支处理。
+ */
+async function postSSE(url, body, onEvent) {
+    const headers = {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+        "x-user-id": getUserId(),
+    };
+    const token = localStorage.getItem("token");
+    if (token) headers.Authorization = `Bearer ${token}`;
+    Object.assign(headers, configHeaders());
+
+    let response;
+    try {
+        response = await fetch(API_BASE_URL + url, {
+            method: "POST",
+            headers,
+            body: JSON.stringify(body),
+        });
+    } catch (error) {
+        const wrapped = new Error(error.message || "网络请求失败");
+        wrapped.status = 0;
+        throw wrapped;
+    }
+
+    if (!response.ok) {
+        let message = `请求失败（${response.status}）`;
+        try {
+            const data = await response.json();
+            message = data.message || data.detail || message;
+        } catch {
+            /* 忽略非 JSON 错误体 */
+        }
+        const wrapped = new Error(message);
+        wrapped.status = response.status;
+        throw wrapped;
+    }
+
+    if (!response.body) {
+        throw new Error("当前浏览器不支持流式响应");
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+    let error = null;
+
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+
+            const lines = buffer.split("\n");
+            buffer = lines.pop();
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed.startsWith("data:")) continue;
+                const payload = trimmed.slice(5).trim();
+                if (!payload) continue;
+                let event;
+                try {
+                    event = JSON.parse(payload);
+                } catch {
+                    continue;
+                }
+                if (event.type === "error") {
+                    error = new Error(event.detail || "流式请求失败");
+                    break;
+                }
+                onEvent(event);
+            }
+            if (error) break;
+        }
+    } finally {
+        try {
+            await reader.cancel();
+        } catch {
+            /* 忽略 */
+        }
+    }
+
+    if (error) throw error;
+}
+
 // ---------- Express 后端实例 ----------
 const service = axios.create({
     baseURL: API_BASE_URL,
@@ -176,8 +264,11 @@ export const documentApi = {
     /** DELETE /api/documents/:id  删除文档（预设接口） */
     remove: (id) => service.delete(`/api/documents/${id}`),
 
-    /** POST /api/documents/:id/reindex  重新解析入库（预设接口） */
+    /** POST /api/documents/:id/reindex  重新解析入库 */
     reindex: (id) => service.post(`/api/documents/${id}/reindex`),
+
+    /** GET /api/documents/:id/file  论文 PDF 预览地址（新标签页打开） */
+    fileUrl: (id) => `${API_BASE_URL}/api/documents/${id}/file`,
 };
 
 /* ---------- 问答 / 检索 ---------- */
@@ -191,14 +282,43 @@ export const qaApi = {
         const p = typeof params === "number" ? { topK: params } : params;
         return service.post("/api/qa/ask", {
             question,
-            top_k: p.topK ?? 3,
+            top_k: p.topK ?? 5,
             model: p.model,
             temperature: p.temperature,
         });
     },
 
-    /** GET /api/qa/search  语义检索（预设接口） */
-    search: (params) => service.get("/api/qa/search", { params }),
+    /**
+     * POST /api/qa/ask（SSE 流式）  RAG 问答逐 token 输出
+     * @param {string} question
+     * @param {{topK?:number, model?:string, temperature?:number}} params
+     * @param {(event:object)=>void} onEvent
+     */
+    askStream(question, params = {}, onEvent) {
+        const p = typeof params === "number" ? { topK: params } : params;
+        return postSSE(
+            "/api/qa/ask",
+            {
+                question,
+                top_k: p.topK ?? 5,
+                model: p.model,
+                temperature: p.temperature,
+            },
+            onEvent
+        );
+    },
+
+    /**
+     * GET /api/qa/search  纯语义检索（只检索向量库，不调用大模型）
+     * @param {{query?:string, q?:string, topK?:number, top_k?:number}} params
+     */
+    search: (params = {}) =>
+        service.get("/api/qa/search", {
+            params: {
+                query: params.query ?? params.q,
+                top_k: params.topK ?? params.top_k ?? 5,
+            },
+        }),
 };
 
 /* ---------- 通用 AI 对话（预设接口） ---------- */
@@ -214,6 +334,24 @@ export const chatApi = {
             model: params.model,
             temperature: params.temperature,
         });
+    },
+
+    /**
+     * POST /api/chat（SSE 流式）  通用 AI 对话逐 token 输出
+     * @param {string} message
+     * @param {{model?:string, temperature?:number}} params
+     * @param {(event:object)=>void} onEvent
+     */
+    stream(message, params = {}, onEvent) {
+        return postSSE(
+            "/api/chat",
+            {
+                message,
+                model: params.model,
+                temperature: params.temperature,
+            },
+            onEvent
+        );
     },
 };
 

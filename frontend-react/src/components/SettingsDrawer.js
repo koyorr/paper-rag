@@ -1,11 +1,5 @@
-import {
-    Brain,
-    KeyRound,
-    SlidersHorizontal,
-    RefreshCw,
-    X,
-} from "lucide-react";
-import { useState, useEffect } from "react";
+import { RefreshCw, X } from "lucide-react";
+import { useState, useEffect, useRef } from "react";
 import useClickOutside from "../hooks/useClickOutside.js";
 import useDrawerResize from "../hooks/useDrawerResize.js";
 import { systemApi, ragApi } from "../api/request.js";
@@ -59,29 +53,255 @@ function mergeOptions(list, current) {
     return [...set];
 }
 
-export default function SettingsDrawer({ open, onClose, initialTab = "api" }) {
-    const [tab, setTab] = useState(initialTab);
+/** 判断模型名是否为 Ollama 风格（含 :tag 后缀，如 qwen3-embedding:8b-q4_K_M） */
+function isOllamaStyleModel(name = "") {
+    return typeof name === "string" && /^[a-zA-Z0-9._-]+:[a-zA-Z0-9._-]+$/.test(name);
+}
+
+/** 云端嵌入模型回退值：与现有向量库（1024 维 text-embedding-v4）保持一致 */
+const CLOUD_EMBEDDING_FALLBACK = "text-embedding-v4";
+
+/** 拉取 Ollama 本地模型列表（对话 / 嵌入可各自触发） */
+function useOllamaModels(enabled, apiUrl) {
+    const [models, setModels] = useState([]);
+    const [loading, setLoading] = useState(false);
+    const [error, setError] = useState("");
+    const [reload, setReload] = useState(0);
+
+    useEffect(() => {
+        if (!enabled) {
+            setModels([]);
+            setError("");
+            return;
+        }
+        let cancelled = false;
+        setLoading(true);
+        setError("");
+        fetchOllamaModels(apiUrl)
+            .then((list) => {
+                if (!cancelled) setModels(list);
+            })
+            .catch((err) => {
+                if (!cancelled) setError(err.message);
+            })
+            .finally(() => {
+                if (!cancelled) setLoading(false);
+            });
+        return () => {
+            cancelled = true;
+        };
+    }, [enabled, apiUrl, reload]);
+
+    return {
+        models,
+        loading,
+        error,
+        reload: () => setReload((v) => v + 1),
+    };
+}
+
+/**
+ * 模型设置抽屉：模型选择 → API 设置 → RAG 参数 一屏展开，
+ * 底部合并一个保存按钮；聊天 / 嵌入模型可共用或分别设置 API。
+ * initialTab 仅用于打开时定位区块（model / api / rag）。
+ */
+export default function SettingsDrawer({ open, onClose, initialTab = "model" }) {
     const { drawerRef, drawerWidth, isResizingClass, onResizeHandleMouseDown } =
         useDrawerResize(480);
     useClickOutside(drawerRef, onClose);
 
-    // 服务商与 Base URL 提升到抽屉层级，供 API / 模型两个页签联动
     const config = getUserConfig();
+
+    // API 使用模式：shared（共用）| separate（分别设置）
+    const [modelApiMode, setModelApiMode] = useState(
+        config.modelApiMode === "separate" ? "separate" : "shared"
+    );
+
+    // 对话侧
     const savedProvider = getProvider(config.provider)
         ? config.provider
         : "deepseek";
     const [provider, setProvider] = useState(savedProvider);
+    const [apiKey, setApiKey] = useState(config.apiKey || "");
     const [apiUrl, setApiUrl] = useState(
         config.apiUrl || getProviderDefaultUrl(savedProvider)
     );
+    const [chatModel, setChatModel] = useState(config.model || "deepseek-chat");
 
+    // 嵌入侧
+    const savedEmbProvider = getProvider(config.embeddingProvider)
+        ? config.embeddingProvider
+        : config.provider || "qwen";
+    const [embeddingProvider, setEmbeddingProvider] = useState(
+        savedEmbProvider
+    );
+    const [embeddingApiKey, setEmbeddingApiKey] = useState(
+        config.embeddingApiKey || config.apiKey || ""
+    );
+    const [embeddingApiUrl, setEmbeddingApiUrl] = useState(
+        config.embeddingApiUrl ||
+            config.apiUrl ||
+            getProviderDefaultUrl(savedEmbProvider)
+    );
+    const [embeddingModel, setEmbeddingModel] = useState(
+        config.embeddingModel || "text-embedding-v4"
+    );
+
+    // RAG 参数
+    const [topK, setTopK] = useState(config.topK ?? 4);
+    const [chunkSize, setChunkSize] = useState(config.chunkSize ?? 800);
+    const [chunkOverlap, setChunkOverlap] = useState(config.chunkOverlap ?? 80);
+    const [temperature, setTemperature] = useState(config.temperature ?? 0.2);
+
+    // 连通性测试
+    const [testing, setTesting] = useState(false);
+    const [conn, setConn] = useState(null);
+
+    // 对话 / 嵌入各自需要的 Ollama 本地模型
+    const chatOllama = useOllamaModels(provider === "ollama", apiUrl);
+    const embIsOllama =
+        (modelApiMode === "separate" ? embeddingProvider : provider) ===
+        "ollama";
+    const embApiUrl =
+        modelApiMode === "separate" ? embeddingApiUrl : apiUrl;
+    const embeddingOllama = useOllamaModels(embIsOllama, embApiUrl);
+
+    const modelSectionRef = useRef(null);
+    const apiSectionRef = useRef(null);
+    const ragSectionRef = useRef(null);
+
+    // 打开时定位到指定区块（默认模型选择；上传引导也会跳到模型选择）
     useEffect(() => {
-        if (open) {
-            setTab(initialTab);
-        }
+        if (!open) return;
+        const sectionMap = {
+            model: modelSectionRef,
+            api: apiSectionRef,
+            rag: ragSectionRef,
+        };
+        const target = sectionMap[initialTab] || modelSectionRef;
+        const frame = requestAnimationFrame(() => {
+            target.current?.scrollIntoView({
+                behavior: "smooth",
+                block: "start",
+            });
+        });
+        return () => cancelAnimationFrame(frame);
     }, [open, initialTab]);
 
+    // 切换模式：进入「分别设置」时用共用配置初始化嵌入侧，避免空值
+    function handleModeChange(mode) {
+        setModelApiMode(mode);
+        if (mode === "separate") {
+            setEmbeddingProvider((prev) => prev || provider);
+            setEmbeddingApiKey((prev) => prev || apiKey);
+            setEmbeddingApiUrl((prev) => prev || apiUrl);
+        }
+    }
+
+    function handleProviderChange(key) {
+        const nextProv = getProvider(key);
+        setProvider(key);
+        setApiUrl(getProviderDefaultUrl(key));
+        // 切换服务商时，若当前模型不在新服务商列表内，回退到该服务商默认模型
+        if (key !== "ollama" && nextProv?.chatModels?.length) {
+            if (!nextProv.chatModels.includes(chatModel)) {
+                setChatModel(nextProv.chatModels[0]);
+            }
+            // shared 模式下嵌入模型跟随主服务商，避免 Ollama 模型名残留
+            if (modelApiMode !== "separate") {
+                setEmbeddingModel(CLOUD_EMBEDDING_FALLBACK);
+            }
+        } else if (key === "ollama" && modelApiMode !== "separate") {
+            // 切到 Ollama：嵌入模型由本地模型列表决定，保留输入框当前值
+        }
+    }
+
+    function handleEmbeddingProviderChange(key) {
+        setEmbeddingProvider(key);
+        setEmbeddingApiUrl(getProviderDefaultUrl(key));
+        // 切到云端服务商时重置嵌入模型，避免残留 Ollama 模型名
+        if (key !== "ollama") {
+            setEmbeddingModel(CLOUD_EMBEDDING_FALLBACK);
+        }
+    }
+
+    async function handleSave() {
+        const shared = { provider, apiKey, apiUrl };
+        const emb =
+            modelApiMode === "separate"
+                ? {
+                      provider: embeddingProvider,
+                      apiKey: embeddingApiKey,
+                      apiUrl: embeddingApiUrl,
+                  }
+                : shared;
+        // 保存前兜底：云端服务商不允许使用 Ollama 风格的嵌入模型，避免检索/问答报错
+        const effEmbProvider = modelApiMode === "separate" ? embeddingProvider : provider;
+        const resolvedEmbeddingModel =
+            effEmbProvider !== "ollama" && isOllamaStyleModel(embeddingModel)
+                ? CLOUD_EMBEDDING_FALLBACK
+                : embeddingModel;
+
+        // 保存前兜底：Ollama 下对话模型必须是本地已下载的模型
+        let resolvedChatModel = chatModel;
+        if (provider === "ollama" && chatOllama.models.length) {
+            if (!chatOllama.models.includes(chatModel)) {
+                const preferred = chatOllama.models.find(
+                    (m) => /qwen/i.test(m) && !/embed/i.test(m)
+                );
+                resolvedChatModel = preferred || chatOllama.models[0];
+            }
+        }
+
+        const next = {
+            name: config.name,
+            modelApiMode,
+            ...shared,
+            model: resolvedChatModel,
+            embeddingProvider: emb.provider,
+            embeddingApiKey: emb.apiKey,
+            embeddingApiUrl: emb.apiUrl,
+            embeddingModel: resolvedEmbeddingModel,
+            topK,
+            chunkSize,
+            chunkOverlap,
+            temperature,
+        };
+        const res = await syncConfig(next);
+        showToast(syncMessage(res));
+        // 保存后不关闭抽屉，便于继续测试连接 / 调整其它参数
+    }
+
+    async function handleTest() {
+        setTesting(true);
+        setConn(null);
+        try {
+            const result = await systemApi.testConnection();
+            setConn(result);
+        } catch (error) {
+            setConn({ backend: false, rag: false, error: error.message });
+        } finally {
+            setTesting(false);
+        }
+    }
+
     if (!open) return null;
+
+    // 对话 / 嵌入模型下拉选项
+    const chatProv = getProvider(provider);
+    const chatOptions =
+        provider === "ollama"
+            ? chatOllama.models
+            : mergeOptions(chatProv?.chatModels || [], chatModel);
+    const embProv = getProvider(
+        modelApiMode === "separate" ? embeddingProvider : provider
+    );
+    const embedOptions = embIsOllama
+        ? embeddingOllama.models
+        : mergeOptions(
+              [...(embProv?.embeddingModels || []), ...COMMON_EMBEDDING_MODELS],
+              embeddingModel
+          );
 
     return (
         <div className="settings-mask" onClick={onClose}>
@@ -98,8 +318,8 @@ export default function SettingsDrawer({ open, onClose, initialTab = "api" }) {
                 ></div>
                 <div className="settings-header">
                     <div>
-                        <h2>设置</h2>
-                        <p>System preferences</p>
+                        <h2>模型设置</h2>
+                        <p>Model settings</p>
                     </div>
                     <button className="icon-button" onClick={onClose}>
                         <X size={20} />
@@ -107,45 +327,94 @@ export default function SettingsDrawer({ open, onClose, initialTab = "api" }) {
                 </div>
 
                 <div className="settings-body">
-                    <div className="settings-menu">
-                        <SettingMenu
-                            icon={<KeyRound />}
-                            text="API 设置"
-                            active={tab === "api"}
-                            onClick={() => setTab("api")}
-                        />
-                        <SettingMenu
-                            icon={<Brain />}
-                            text="模型设置"
-                            active={tab === "model"}
-                            onClick={() => setTab("model")}
-                        />
-                        <SettingMenu
-                            icon={<SlidersHorizontal />}
-                            text="RAG 参数"
-                            active={tab === "rag"}
-                            onClick={() => setTab("rag")}
-                        />
-                    </div>
-
                     <div className="settings-content">
-                        {tab === "api" && (
-                            <ApiSettings
+                        <section ref={modelSectionRef} className="settings-section">
+                            <ModelSelectSection
+                                modelApiMode={modelApiMode}
+                                onModeChange={handleModeChange}
                                 provider={provider}
-                                onProviderChange={setProvider}
+                                embeddingProvider={embeddingProvider}
+                                chatModel={chatModel}
+                                onChatModelChange={setChatModel}
+                                embeddingModel={embeddingModel}
+                                onEmbeddingModelChange={setEmbeddingModel}
+                                chatOptions={chatOptions}
+                                embedOptions={embedOptions}
+                                embIsOllama={embIsOllama}
+                                chatOllama={chatOllama}
+                                embeddingOllama={embeddingOllama}
+                            />
+                        </section>
+                        <section ref={apiSectionRef} className="settings-section">
+                            <ApiSettingsSection
+                                modelApiMode={modelApiMode}
+                                provider={provider}
+                                onProviderChange={handleProviderChange}
+                                apiKey={apiKey}
+                                onApiKeyChange={setApiKey}
                                 apiUrl={apiUrl}
                                 onApiUrlChange={setApiUrl}
-                                onClose={onClose}
+                                embeddingProvider={embeddingProvider}
+                                onEmbeddingProviderChange={
+                                    handleEmbeddingProviderChange
+                                }
+                                embeddingApiKey={embeddingApiKey}
+                                onEmbeddingApiKeyChange={setEmbeddingApiKey}
+                                embeddingApiUrl={embeddingApiUrl}
+                                onEmbeddingApiUrlChange={setEmbeddingApiUrl}
                             />
-                        )}
-                        {tab === "model" && (
-                            <ModelSettings
-                                provider={provider}
-                                apiUrl={apiUrl}
-                                onClose={onClose}
+                        </section>
+                        <section ref={ragSectionRef} className="settings-section">
+                            <RagSettingsSection
+                                topK={topK}
+                                onTopKChange={setTopK}
+                                chunkSize={chunkSize}
+                                onChunkSizeChange={setChunkSize}
+                                chunkOverlap={chunkOverlap}
+                                onChunkOverlapChange={setChunkOverlap}
+                                temperature={temperature}
+                                onTemperatureChange={setTemperature}
                             />
+                        </section>
+
+                        <div className="settings-footer">
+                            <button
+                                className="primary-button settings-save-btn"
+                                onClick={handleSave}
+                            >
+                                保存
+                            </button>
+                            <button
+                                className="toolbar-btn"
+                                onClick={handleTest}
+                                disabled={testing}
+                            >
+                                {testing ? "测试中..." : "测试连接"}
+                            </button>
+                        </div>
+
+                        {conn && (
+                            <div className="conn-status">
+                                <div
+                                    className={`conn-item ${
+                                        conn.backend ? "online" : "offline"
+                                    }`}
+                                >
+                                    <span className="conn-dot" />
+                                    后端服务 (127.0.0.1:3000) ——{" "}
+                                    {conn.backend ? "在线" : "离线"}
+                                </div>
+                                <div
+                                    className={`conn-item ${
+                                        conn.rag ? "online" : "offline"
+                                    }`}
+                                >
+                                    <span className="conn-dot" />
+                                    RAG 服务 (127.0.0.1:8000) ——{" "}
+                                    {conn.rag ? "在线" : "离线"}
+                                </div>
+                            </div>
                         )}
-                        {tab === "rag" && <RagSettings onClose={onClose} />}
                     </div>
                 </div>
             </div>
@@ -153,30 +422,204 @@ export default function SettingsDrawer({ open, onClose, initialTab = "api" }) {
     );
 }
 
-function SettingMenu({ icon, text, active, onClick }) {
+function ModelSelectSection({
+    modelApiMode,
+    onModeChange,
+    provider,
+    embeddingProvider,
+    chatModel,
+    onChatModelChange,
+    embeddingModel,
+    onEmbeddingModelChange,
+    chatOptions,
+    embedOptions,
+    embIsOllama,
+    chatOllama,
+    embeddingOllama,
+}) {
+    const chatProvName = getProvider(provider)?.label || provider;
+    const embProvName =
+        getProvider(modelApiMode === "separate" ? embeddingProvider : provider)
+            ?.label ||
+        embeddingProvider ||
+        provider;
+
     return (
-        <button
-            className={`settings-menu-item ${active ? "active" : ""}`}
-            onClick={onClick}
-        >
-            {icon}
-            {text}
-        </button>
+        <>
+            <h3>模型选择</h3>
+            <p className="settings-subtitle">
+                选择对话与文本嵌入模型，可共用或分别设置 API
+            </p>
+
+            <div className="mode-toggle">
+                <button
+                    className={modelApiMode === "shared" ? "active" : ""}
+                    onClick={() => onModeChange("shared")}
+                >
+                    共用一个 API
+                </button>
+                <button
+                    className={modelApiMode === "separate" ? "active" : ""}
+                    onClick={() => onModeChange("separate")}
+                >
+                    分别设置 API
+                </button>
+            </div>
+
+            {modelApiMode === "separate" && (
+                <p className="settings-subtitle">
+                    对话模型：{chatProvName} ｜ 嵌入模型：{embProvName}
+                </p>
+            )}
+
+            <label>
+                Chat Model
+                <select
+                    value={chatModel}
+                    onChange={(e) => onChatModelChange(e.target.value)}
+                >
+                    {chatOptions.length > 0 ? (
+                        chatOptions.map((m) => (
+                            <option key={m} value={m}>
+                                {m}
+                            </option>
+                        ))
+                    ) : (
+                        <option value={chatModel}>
+                            {chatModel || "（未选择）"}
+                        </option>
+                    )}
+                </select>
+            </label>
+            {provider === "ollama" && (
+                <OllamaPanel
+                    ollama={chatOllama}
+                    title="对话（本地 Ollama）"
+                    hint="对话模型示例：qwen2.5、llama3、deepseek-r1"
+                />
+            )}
+
+            <label>
+                Embedding Model
+                <select
+                    value={embeddingModel}
+                    onChange={(e) => onEmbeddingModelChange(e.target.value)}
+                >
+                    {embedOptions.length > 0 ? (
+                        embedOptions.map((m) => (
+                            <option key={m} value={m}>
+                                {m}
+                            </option>
+                        ))
+                    ) : (
+                        <option value={embeddingModel}>
+                            {embeddingModel || "（未选择）"}
+                        </option>
+                    )}
+                </select>
+            </label>
+            {embIsOllama && (
+                <OllamaPanel
+                    ollama={embeddingOllama}
+                    title="嵌入（本地 Ollama）"
+                    hint="嵌入模型示例：nomic-embed-text、bge-m3、mxbai-embed-large"
+                />
+            )}
+        </>
     );
 }
 
-function ApiSettings({
+function OllamaPanel({ ollama, title, hint }) {
+    return (
+        <div className="ollama-panel">
+            {title && <p className="api-block-title">{title}</p>}
+            <div className="ollama-bar">
+                <RefreshCw
+                    size={15}
+                    className={ollama.loading ? "spin" : ""}
+                />
+                <span>
+                    {ollama.loading
+                        ? "正在读取本地模型..."
+                        : ollama.models.length > 0
+                        ? `已检测到 ${ollama.models.length} 个本地模型`
+                        : "未检测到本地模型"}
+                </span>
+                <button
+                    className="toolbar-btn"
+                    onClick={ollama.reload}
+                    disabled={ollama.loading}
+                >
+                    刷新
+                </button>
+            </div>
+            {ollama.error && <p className="ollama-error">{ollama.error}</p>}
+            <p className="ollama-hint">{hint}</p>
+        </div>
+    );
+}
+
+function ApiSettingsSection({
+    modelApiMode,
     provider,
     onProviderChange,
+    apiKey,
+    onApiKeyChange,
     apiUrl,
     onApiUrlChange,
-    onClose,
+    embeddingProvider,
+    onEmbeddingProviderChange,
+    embeddingApiKey,
+    onEmbeddingApiKeyChange,
+    embeddingApiUrl,
+    onEmbeddingApiUrlChange,
 }) {
-    const config = getUserConfig();
-    const [apiKey, setApiKey] = useState(config.apiKey || "");
-    const [testing, setTesting] = useState(false);
-    const [conn, setConn] = useState(null);
+    return (
+        <>
+            <h3>API 设置</h3>
+            <p className="settings-subtitle">
+                配置 API 连接参数（保存后同步到后端与 RAG 服务）
+            </p>
 
+            <div className="api-block">
+                <p className="api-block-title">
+                    {modelApiMode === "separate" ? "对话 API" : "对话与嵌入共用"}
+                </p>
+                <ProviderFields
+                    provider={provider}
+                    onProviderChange={onProviderChange}
+                    apiKey={apiKey}
+                    onApiKeyChange={onApiKeyChange}
+                    apiUrl={apiUrl}
+                    onApiUrlChange={onApiUrlChange}
+                />
+            </div>
+
+            {modelApiMode === "separate" && (
+                <div className="api-block">
+                    <p className="api-block-title">嵌入 API</p>
+                    <ProviderFields
+                        provider={embeddingProvider}
+                        onProviderChange={onEmbeddingProviderChange}
+                        apiKey={embeddingApiKey}
+                        onApiKeyChange={onEmbeddingApiKeyChange}
+                        apiUrl={embeddingApiUrl}
+                        onApiUrlChange={onEmbeddingApiUrlChange}
+                    />
+                </div>
+            )}
+        </>
+    );
+}
+
+function ProviderFields({
+    provider,
+    onProviderChange,
+    apiKey,
+    onApiKeyChange,
+    apiUrl,
+    onApiUrlChange,
+}) {
     const currentProvider = getProvider(provider);
     const regionOptions =
         currentProvider?.baseUrls && currentProvider.baseUrls.length > 1
@@ -185,43 +628,13 @@ function ApiSettings({
     const regionIndex = regionOptions.findIndex((v) => v.url === apiUrl);
     const isOllama = provider === "ollama";
 
-    // 切换服务商：自动填充对应 Base URL（多区域取默认第一个）
-    function handleProviderChange(key) {
-        onProviderChange(key);
-        onApiUrlChange(getProviderDefaultUrl(key));
-    }
-
-    async function handleSave() {
-        const next = { ...config, provider, apiKey, apiUrl };
-        const res = await syncConfig(next);
-        showToast(syncMessage(res));
-        onClose();
-    }
-
-    async function handleTest() {
-        setTesting(true);
-        setConn(null);
-        try {
-            const result = await systemApi.testConnection();
-            setConn(result);
-        } catch (error) {
-            setConn({ backend: false, rag: false, error: error.message });
-        } finally {
-            setTesting(false);
-        }
-    }
-
     return (
         <>
-            <h3>API 设置</h3>
-            <p className="settings-subtitle">
-                配置 API 连接参数（保存后同步到后端与 RAG 服务）
-            </p>
             <label>
                 API Provider
                 <select
                     value={provider}
-                    onChange={(e) => handleProviderChange(e.target.value)}
+                    onChange={(e) => onProviderChange(e.target.value)}
                 >
                     {PROVIDERS.map((p) => (
                         <option key={p.key} value={p.key}>
@@ -235,9 +648,16 @@ function ApiSettings({
                 <input
                     type="password"
                     value={apiKey}
-                    onChange={(e) => setApiKey(e.target.value)}
-                    placeholder={isOllama ? "Ollama 本地可不填" : "sk-..."}
+                    onChange={(e) => onApiKeyChange(e.target.value)}
+                    placeholder={isOllama ? "本地 Ollama 不需要 API Key" : "sk-..."}
+                    disabled={isOllama}
+                    title={isOllama ? "本地 Ollama 不需要 API Key" : ""}
                 />
+                {isOllama && (
+                    <span className="field-hint">
+                        本地 Ollama 不需要 API Key，已自动禁用
+                    </span>
+                )}
             </label>
             {regionOptions.length > 0 && (
                 <label>
@@ -280,215 +700,23 @@ function ApiSettings({
             </label>
             {isOllama && (
                 <p className="settings-subtitle">
-                    本地接入：Base URL 使用 http://127.0.0.1:11434/v1，API Key
-                    可留空
+                    本地接入：Base URL 使用 http://127.0.0.1:11434/v1，无需 API Key
                 </p>
             )}
-
-            <div className="settings-actions">
-                <button className="primary-button" onClick={handleSave}>
-                    保存 API
-                </button>
-                <button
-                    className="toolbar-btn"
-                    onClick={handleTest}
-                    disabled={testing}
-                >
-                    {testing ? "测试中..." : "测试连接"}
-                </button>
-            </div>
-
-            {conn && (
-                <div className="conn-status">
-                    <div
-                        className={`conn-item ${
-                            conn.backend ? "online" : "offline"
-                        }`}
-                    >
-                        <span className="conn-dot" />
-                        后端服务 (127.0.0.1:3000) ——{" "}
-                        {conn.backend ? "在线" : "离线"}
-                    </div>
-                    <div
-                        className={`conn-item ${conn.rag ? "online" : "offline"}`}
-                    >
-                        <span className="conn-dot" />
-                        RAG 服务 (127.0.0.1:8000) ——{" "}
-                        {conn.rag ? "在线" : "离线"}
-                    </div>
-                </div>
-            )}
         </>
     );
 }
 
-function ModelSettings({ provider, apiUrl, onClose }) {
-    const config = getUserConfig();
-    const [chatModel, setChatModel] = useState(config.model || "deepseek-chat");
-    const [embeddingModel, setEmbeddingModel] = useState(
-        config.embeddingModel || "text-embedding-v4"
-    );
-    const [ollamaModels, setOllamaModels] = useState([]);
-    const [ollamaLoading, setOllamaLoading] = useState(false);
-    const [ollamaError, setOllamaError] = useState("");
-    const [ollamaReload, setOllamaReload] = useState(0);
-
-    const isOllama = provider === "ollama";
-
-    // 选择 Ollama 时自动读取本地已下载模型
-    useEffect(() => {
-        if (!isOllama) {
-            setOllamaModels([]);
-            setOllamaError("");
-            return;
-        }
-        let cancelled = false;
-        setOllamaLoading(true);
-        setOllamaError("");
-        fetchOllamaModels(apiUrl)
-            .then((list) => {
-                if (!cancelled) setOllamaModels(list);
-            })
-            .catch((error) => {
-                if (!cancelled) setOllamaError(error.message);
-            })
-            .finally(() => {
-                if (!cancelled) setOllamaLoading(false);
-            });
-        return () => {
-            cancelled = true;
-        };
-    }, [isOllama, apiUrl, ollamaReload]);
-
-    const prov = getProvider(provider);
-    const chatOptions = isOllama
-        ? ollamaModels
-        : mergeOptions(prov?.chatModels || [], chatModel);
-    const embedOptions = isOllama
-        ? ollamaModels
-        : mergeOptions(
-              [...(prov?.embeddingModels || []), ...COMMON_EMBEDDING_MODELS],
-              embeddingModel
-          );
-
-    async function handleSave() {
-        const next = {
-            ...config,
-            provider,
-            apiUrl,
-            model: chatModel,
-            embeddingModel,
-        };
-        const res = await syncConfig(next);
-        showToast(syncMessage(res));
-        onClose();
-    }
-
-    return (
-        <>
-            <h3>模型设置</h3>
-            <p className="settings-subtitle">
-                {isOllama
-                    ? "使用本地 Ollama 模型（自动读取已下载模型）"
-                    : "选择对话与文本嵌入模型"}
-            </p>
-
-            {isOllama && (
-                <div className="ollama-panel">
-                    <div className="ollama-bar">
-                        <RefreshCw
-                            size={15}
-                            className={ollamaLoading ? "spin" : ""}
-                        />
-                        <span>
-                            {ollamaLoading
-                                ? "正在读取本地模型..."
-                                : ollamaModels.length > 0
-                                ? `已检测到 ${ollamaModels.length} 个本地模型`
-                                : "未检测到本地模型"}
-                        </span>
-                        <button
-                            className="toolbar-btn"
-                            onClick={() => setOllamaReload((v) => v + 1)}
-                            disabled={ollamaLoading}
-                        >
-                            刷新
-                        </button>
-                    </div>
-                    {ollamaError && (
-                        <p className="ollama-error">{ollamaError}</p>
-                    )}
-                    <p className="ollama-hint">
-                        嵌入模型示例：nomic-embed-text、bge-m3、mxbai-embed-large
-                    </p>
-                </div>
-            )}
-
-            <label>
-                Chat Model
-                <select
-                    value={chatModel}
-                    onChange={(e) => setChatModel(e.target.value)}
-                >
-                    {chatOptions.length > 0 ? (
-                        chatOptions.map((m) => (
-                            <option key={m} value={m}>
-                                {m}
-                            </option>
-                        ))
-                    ) : (
-                        <option value={chatModel}>
-                            {chatModel || "（未选择）"}
-                        </option>
-                    )}
-                </select>
-            </label>
-            <label>
-                Embedding Model
-                <select
-                    value={embeddingModel}
-                    onChange={(e) => setEmbeddingModel(e.target.value)}
-                >
-                    {embedOptions.length > 0 ? (
-                        embedOptions.map((m) => (
-                            <option key={m} value={m}>
-                                {m}
-                            </option>
-                        ))
-                    ) : (
-                        <option value={embeddingModel}>
-                            {embeddingModel || "（未选择）"}
-                        </option>
-                    )}
-                </select>
-            </label>
-            <button className="primary-button" onClick={handleSave}>
-                保存模型
-            </button>
-        </>
-    );
-}
-
-function RagSettings({ onClose }) {
-    const config = getUserConfig();
-    const [topK, setTopK] = useState(config.topK ?? 4);
-    const [chunkSize, setChunkSize] = useState(config.chunkSize ?? 800);
-    const [chunkOverlap, setChunkOverlap] = useState(config.chunkOverlap ?? 80);
-    const [temperature, setTemperature] = useState(config.temperature ?? 0.2);
-
-    async function handleSave() {
-        const next = {
-            ...config,
-            topK,
-            chunkSize,
-            chunkOverlap,
-            temperature,
-        };
-        const res = await syncConfig(next);
-        showToast(syncMessage(res));
-        onClose();
-    }
-
+function RagSettingsSection({
+    topK,
+    onTopKChange,
+    chunkSize,
+    onChunkSizeChange,
+    chunkOverlap,
+    onChunkOverlapChange,
+    temperature,
+    onTemperatureChange,
+}) {
     return (
         <>
             <h3>RAG 参数</h3>
@@ -498,7 +726,7 @@ function RagSettings({ onClose }) {
                 <input
                     type="number"
                     value={topK}
-                    onChange={(e) => setTopK(Number(e.target.value))}
+                    onChange={(e) => onTopKChange(Number(e.target.value))}
                 />
             </label>
             <label>
@@ -506,7 +734,7 @@ function RagSettings({ onClose }) {
                 <input
                     type="number"
                     value={chunkSize}
-                    onChange={(e) => setChunkSize(Number(e.target.value))}
+                    onChange={(e) => onChunkSizeChange(Number(e.target.value))}
                 />
             </label>
             <label>
@@ -514,7 +742,9 @@ function RagSettings({ onClose }) {
                 <input
                     type="number"
                     value={chunkOverlap}
-                    onChange={(e) => setChunkOverlap(Number(e.target.value))}
+                    onChange={(e) =>
+                        onChunkOverlapChange(Number(e.target.value))
+                    }
                 />
             </label>
             <label>
@@ -523,12 +753,9 @@ function RagSettings({ onClose }) {
                     type="number"
                     step="0.1"
                     value={temperature}
-                    onChange={(e) => setTemperature(Number(e.target.value))}
+                    onChange={(e) => onTemperatureChange(Number(e.target.value))}
                 />
             </label>
-            <button className="primary-button" onClick={handleSave}>
-                保存参数
-            </button>
         </>
     );
 }

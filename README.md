@@ -95,11 +95,13 @@ paper-rag/
 
 ```bash
 cd rag_service
-python -m venv .venv
+py -3.11 -m venv .venv
 .venv/Scripts/activate          # Windows
-pip install -r requirements.txt
+pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 # 配置 .env（参考 .env.example）：DASHSCOPE_API_KEY 等
 uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+# 检查本地端口是否占用
+netstat -ano | findstr :8000  
 ```
 
 ### 2. 启动后端（:3000）
@@ -108,7 +110,9 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 cd backend
 npm install
 cp .env.example .env            # 填入 DATABASE_URL
-npx prisma migrate deploy       # 初始化数据库
+#npx prisma migrate deploy       # 初始化数据库
+npx prisma migrate reset        # 重置数据库（仅限开发环境）
+npx prisma db push              # 根据schema.prisma 直接同步数据库结构，适合开发环境
 node src/app.js
 ```
 
@@ -144,8 +148,8 @@ npm run dev
 
 | 服务 | 主要接口 |
 | --- | --- |
-| 后端 :3000 | `GET /health` · `POST /api/documents/upload` · `GET /api/documents` · `DELETE /api/documents/:id` · `POST /api/qa/ask` · `POST /api/chat` · `POST /api/config` |
-| RAG :8000 | `GET /health` · `POST /ingest` · `POST /query` · `GET/POST /config` |
+| 后端 :3000 | `GET /health` · `POST /api/documents/upload` · `GET /api/documents` · `DELETE /api/documents/:id` · `POST /api/qa/ask` · `GET /api/qa/search` · `POST /api/chat` · `POST /api/config` |
+| RAG :8000 | `GET /health` · `POST /ingest` · `POST /query` · `POST /search` · `POST /chat` · `GET/POST /config` |
 
 ---
 

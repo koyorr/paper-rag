@@ -15,6 +15,13 @@ import {
 } from "lucide-react";
 import { useState, useRef, useEffect, useCallback } from "react";
 import { documentApi } from "../api/request.js";
+import {
+    getUserConfig,
+    getChatConfig,
+    getEmbeddingConfig,
+} from "../store/userConfig.js";
+import { openSettings } from "../store/settingsStore.js";
+import { showToast } from "../store/toastStore.js";
 
 const LOCAL_KEY = "paperhub_files";
 
@@ -44,8 +51,26 @@ function normalizeServerFile(item) {
     };
 }
 
+/** 上传前置校验：对话 / 嵌入两侧的模型与 API 是否都已配置（支持分别设置） */
+function isConfigReady() {
+    const cfg = getUserConfig();
+    const chat = getChatConfig(cfg);
+    const emb = getEmbeddingConfig(cfg);
+    const chatOk =
+        !!chat.provider &&
+        (chat.provider === "ollama" || !!chat.apiKey) &&
+        !!chat.model;
+    const embOk =
+        !!emb.provider &&
+        (emb.provider === "ollama" || !!emb.apiKey) &&
+        !!emb.model;
+    return chatOk && embOk;
+}
+
 export default function FileManager() {
     const [selectedFiles, setSelectedFiles] = useState([]); // 当前选中的 File 对象
+    // 表格中勾选待删除的文档 id
+    const [checkedIds, setCheckedIds] = useState([]);
     const [uploading, setUploading] = useState(false);
     const [loadingList, setLoadingList] = useState(false);
     const [message, setMessage] = useState("");
@@ -56,6 +81,14 @@ export default function FileManager() {
     const [statusFilterOpen, setStatusFilterOpen] = useState(false);
     const statusFilterRef = useRef(null);
     const fileInputRef = useRef(null);
+
+    // 上传前置配置是否就绪（保存设置后通过 user-config-change 事件刷新）
+    const [configReady, setConfigReady] = useState(() => isConfigReady());
+    useEffect(() => {
+        const refresh = () => setConfigReady(isConfigReady());
+        window.addEventListener("user-config-change", refresh);
+        return () => window.removeEventListener("user-config-change", refresh);
+    }, []);
 
     // 本地文件列表（含状态）
     const [files, setFiles] = useState(() => {
@@ -71,6 +104,7 @@ export default function FileManager() {
 
     // 列宽状态（初始值，单位px）
     const [columnWidths, setColumnWidths] = useState({
+        check: 44,
         index: 60,
         name: 200,
         size: 100,
@@ -229,6 +263,13 @@ export default function FileManager() {
     const handleUpload = async () => {
         if (selectedFiles.length === 0) return;
 
+        // 未配置模型 / API 时拦截上传并引导去模型设置
+        if (!configReady) {
+            showToast("请先选择模型并配置模型参数");
+            openSettings("model");
+            return;
+        }
+
         setUploading(true);
         setMessage("");
         setMessageType("info");
@@ -324,13 +365,51 @@ export default function FileManager() {
             setMessageType("info");
         }
         setFiles((prev) => prev.filter((f) => f.id !== id));
+        setCheckedIds((prev) => prev.filter((x) => x !== id));
         setTimeout(() => setMessage(""), 3000);
     };
 
-    // 重新上传
+    // 勾选 / 取消勾选
+    const toggleChecked = (id) =>
+        setCheckedIds((prev) =>
+            prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+        );
+
+    // 批量删除勾选的文件
+    const handleBatchDelete = async () => {
+        const targets = files.filter((f) => checkedIds.includes(f.id));
+        if (targets.length === 0) return;
+        if (!window.confirm(`确定删除选中的 ${targets.length} 个文件吗？`)) return;
+
+        let ok = 0;
+        let fail = 0;
+        const errors = [];
+        for (const item of targets) {
+            try {
+                await documentApi.remove(item.id);
+                ok++;
+            } catch (error) {
+                console.warn("删除失败", item.id, error);
+                fail++;
+                errors.push(item.name);
+            }
+        }
+        setFiles((prev) => prev.filter((f) => !checkedIds.includes(f.id)));
+        setCheckedIds([]);
+        setMessage(
+            `${ok} 个删除成功${fail ? `，${fail} 个失败（${errors.join("、")}）` : ""}`
+        );
+        setMessageType(fail ? "error" : "success");
+        setTimeout(() => setMessage(""), 4000);
+    };
+
+    // 重新上传 = 重新解析入库（删除旧向量后重新分块向量化，避免重复上传被去重拦截）
     const handleReupload = async (fileItem) => {
-        if (!fileItem.file) {
-            setMessage("无法重新上传，请重新选择文件");
+        const id = fileItem.id;
+        const realId =
+            typeof id === "number" || /^\d+$/.test(String(id)) ? id : null;
+        if (realId == null) {
+            setMessage("无法重新解析，请刷新列表后再试");
             setMessageType("error");
             return;
         }
@@ -338,39 +417,39 @@ export default function FileManager() {
         // 设置为 processing
         setFiles((prev) =>
             prev.map((f) =>
-                f.id === fileItem.id
+                f.id === id
                     ? { ...f, status: "processing", chunks: 0, errorMsg: null }
                     : f
             )
         );
 
         try {
-            const data = await documentApi.upload(fileItem.file);
+            const data = await documentApi.reindex(realId);
 
-            const updated = {
-                ...fileItem,
-                id: data.documentId,
-                chunks: data.chunks || 0,
-                status: "ready",
-                time: data.uploadTime || new Date().toLocaleString(),
-                uploadTime: data.uploadTime || new Date().toISOString(),
-                errorMsg: null,
-            };
-            setFiles((prev) =>
-                prev.map((f) => (f.id === fileItem.id ? updated : f))
-            );
-            setMessage(`${fileItem.name} 重新上传成功`);
-            setMessageType("success");
-        } catch (error) {
-            const errorMsg = error.message || "上传失败";
             setFiles((prev) =>
                 prev.map((f) =>
-                    f.id === fileItem.id
+                    f.id === id
+                        ? {
+                              ...f,
+                              status: "ready",
+                              chunks: data.chunks || f.chunks || 0,
+                              errorMsg: null,
+                          }
+                        : f
+                )
+            );
+            setMessage(`${fileItem.name} 重新解析成功`);
+            setMessageType("success");
+        } catch (error) {
+            const errorMsg = error.message || "重新解析失败";
+            setFiles((prev) =>
+                prev.map((f) =>
+                    f.id === id
                         ? { ...f, status: "error", errorMsg }
                         : f
                 )
             );
-            setMessage(`${fileItem.name} 重新上传失败：${errorMsg}`);
+            setMessage(`${fileItem.name} 重新解析失败：${errorMsg}`);
             setMessageType("error");
         }
         setTimeout(() => setMessage(""), 5000);
@@ -516,6 +595,19 @@ export default function FileManager() {
                 <p>上传并管理你的研究文档</p>
             </div>
 
+            {/* 未配置模型 / API 时的提示 */}
+            {!configReady && (
+                <div className="config-hint">
+                    <span>请先选择模型并配置模型参数，再上传文件</span>
+                    <button
+                        className="config-hint-btn"
+                        onClick={() => openSettings("model")}
+                    >
+                        去配置
+                    </button>
+                </div>
+            )}
+
             {/* 上传面板 */}
             <div className="upload-panel">
                 <UploadCloud size={30} />
@@ -594,6 +686,15 @@ export default function FileManager() {
                         <span className="filter-chip-x">✕</span>
                     </button>
                 )}
+                {checkedIds.length > 0 && (
+                    <button
+                        className="toolbar-btn batch-delete-btn"
+                        onClick={handleBatchDelete}
+                    >
+                        <Trash2 size={15} />
+                        删除选中（{checkedIds.length}）
+                    </button>
+                )}
                 <button
                     className="toolbar-btn"
                     onClick={loadFiles}
@@ -608,6 +709,7 @@ export default function FileManager() {
             <div className="file-table-wrapper">
                 <table className="file-table" style={{ tableLayout: "fixed" }}>
                     <colgroup>
+                        <col style={{ width: columnWidths.check + "px" }} />
                         <col style={{ width: columnWidths.index + "px" }} />
                         <col style={{ width: columnWidths.name + "px" }} />
                         <col style={{ width: columnWidths.size + "px" }} />
@@ -618,6 +720,28 @@ export default function FileManager() {
                     </colgroup>
                     <thead>
                         <tr>
+                            <th style={{ width: columnWidths.check + "px" }}>
+                                <input
+                                    type="checkbox"
+                                    className="file-checkbox"
+                                    checked={
+                                        filteredFiles.length > 0 &&
+                                        filteredFiles.every((f) =>
+                                            checkedIds.includes(f.id)
+                                        )
+                                    }
+                                    onChange={(e) => {
+                                        if (e.target.checked) {
+                                            setCheckedIds(
+                                                filteredFiles.map((f) => f.id)
+                                            );
+                                        } else {
+                                            setCheckedIds([]);
+                                        }
+                                    }}
+                                    title="全选"
+                                />
+                            </th>
                             {renderHeader("序号", "index", columnWidths.index)}
                             {renderHeader("文件名", "name", columnWidths.name)}
                             {renderHeader("文件大小", "size", columnWidths.size)}
@@ -630,11 +754,32 @@ export default function FileManager() {
                     <tbody>
                         {filteredFiles.map((item, index) => (
                             <tr key={item.id}>
+                                <td>
+                                    <input
+                                        type="checkbox"
+                                        className="file-checkbox"
+                                        checked={checkedIds.includes(item.id)}
+                                        onChange={() => toggleChecked(item.id)}
+                                    />
+                                </td>
                                 <td>{index + 1}</td>
                                 <td>
                                     <div className="file-name-cell">
                                         <FileText size={16} />
-                                        <span>{item.name}</span>
+                                        {typeof item.id === "number" ||
+                                        /^\d+$/.test(String(item.id)) ? (
+                                            <a
+                                                className="file-name-link"
+                                                href={documentApi.fileUrl(item.id)}
+                                                target="_blank"
+                                                rel="noreferrer"
+                                                title="点击打开论文"
+                                            >
+                                                {item.name}
+                                            </a>
+                                        ) : (
+                                            <span>{item.name}</span>
+                                        )}
                                     </div>
                                 </td>
                                 <td>{formatSize(item.size)}</td>

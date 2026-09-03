@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { qaApi, chatApi } from "../api/request.js";
 import { addRecentSession, recordApiUsage } from "../utils/chatStorage.js";
-import { getUserConfig } from "../store/userConfig.js";
+import { getUserConfig, getChatConfig } from "../store/userConfig.js";
 
 export default function ChatSession({
     initialMode = "rag",
@@ -11,6 +11,7 @@ export default function ChatSession({
     initialMessages = [],
     fullPage = false,
     onClose,
+    onMessagesChange,
 }) {
     const navigate = useNavigate();
     const [mode, setMode] = useState(initialMode);
@@ -28,6 +29,12 @@ export default function ChatSession({
         });
     }, [messages, loading]);
 
+    // 消息变化时上报给父组件（用于侧边聊天持久化）
+    useEffect(() => {
+        onMessagesChange?.(messages);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [messages]);
+
     useEffect(() => {
         if (initialQuestion && !initialized.current) {
             initialized.current = true;
@@ -44,43 +51,78 @@ export default function ChatSession({
         setQuestion("");
         setMessages((prev) => [
             ...prev,
-            { role: "user", content: text },
+            { role: "user", content: text, mode },
+        ]);
+        // 先放一个空的流式气泡，后续逐 token 填充
+        setMessages((prev) => [
+            ...prev,
+            { role: "assistant", content: "", streaming: true, mode },
         ]);
         setLoading(true);
 
+        let answer = "";
+        let sources = [];
+        let usage = {};
+        const config = getUserConfig();
+
+        function patchAnswer(value) {
+            setMessages((prev) => {
+                const next = [...prev];
+                const last = next[next.length - 1];
+                if (last && last.role === "assistant" && last.streaming) {
+                    next[next.length - 1] = { ...last, content: value };
+                }
+                return next;
+            });
+        }
+
+        function finalizeMessage(overrides = {}) {
+            setMessages((prev) => {
+                const next = [...prev];
+                const last = next[next.length - 1];
+                if (last && last.role === "assistant" && last.streaming) {
+                    next[next.length - 1] = {
+                        ...last,
+                        content: answer || "AI 没有返回内容",
+                        streaming: false,
+                        sources,
+                        ...overrides,
+                    };
+                }
+                return next;
+            });
+        }
+
         try {
-            const config = getUserConfig();
-            let response;
+            const onEvent = (evt) => {
+                if (evt.type === "delta") {
+                    answer += evt.content || "";
+                    patchAnswer(answer);
+                } else if (evt.type === "sources") {
+                    sources = evt.sources || [];
+                } else if (evt.type === "usage") {
+                    usage = evt.usage || {};
+                }
+            };
 
             if (mode === "rag") {
-                // 论文检索：走 RAG 问答接口（携带模型 / RAG 参数）
-                response = await qaApi.ask(text, {
-                    topK: config.topK ?? 3,
-                    model: config.model,
+                // 论文检索：RAG 问答流式输出（携带模型 / RAG 参数）
+                await qaApi.askStream(text, {
+                    topK: config.topK ?? 5,
+                    model: getChatConfig(config).model,
                     temperature: config.temperature,
-                });
+                }, onEvent);
             } else {
-                // 普通 AI 对话接口（预设 POST /api/chat，携带模型参数）
-                response = await chatApi.send(text, {
-                    model: config.model,
+                // 普通 AI 对话：/api/chat 流式输出
+                await chatApi.stream(text, {
+                    model: getChatConfig(config).model,
                     temperature: config.temperature,
-                });
+                }, onEvent);
             }
 
-            const answer =
-                response.answer ?? response.message ?? "AI 没有返回内容";
-
-            setMessages((prev) => [
-                ...prev,
-                {
-                    role: "assistant",
-                    content: answer,
-                    sources: response.sources ?? [],
-                },
-            ]);
-
+            finalizeMessage();
             addRecentSession({ mode, question: text, answer });
-            recordApiUsage(response.usage);
+            recordApiUsage(usage);
         } catch (error) {
             console.error(error);
             let errorMessage = "请求失败，请检查后端服务。";
@@ -89,10 +131,7 @@ export default function ChatSession({
             } else if (error.message) {
                 errorMessage = error.message;
             }
-            setMessages((prev) => [
-                ...prev,
-                { role: "assistant", content: errorMessage, error: true },
-            ]);
+            finalizeMessage({ content: errorMessage, error: true });
         } finally {
             setLoading(false);
         }
@@ -100,6 +139,18 @@ export default function ChatSession({
 
     function fullscreen() {
         navigate("/chat", { state: { mode, messages } });
+    }
+
+    // 按对话类型分组：连续相同 mode 的轮次合并为一组，便于区分论文检索 / AI 对话
+    const groups = [];
+    for (const message of messages) {
+        const m = message.mode || initialMode;
+        const last = groups[groups.length - 1];
+        if (last && last.mode === m) {
+            last.items.push(message);
+        } else {
+            groups.push({ mode: m, items: [message] });
+        }
     }
 
     return (
@@ -149,27 +200,47 @@ export default function ChatSession({
                     </div>
                 )}
 
-                {messages.map((message, index) => (
-                    <div key={index} className={`chat-message ${message.role}`}>
-                        <div className="message-bubble">{message.content}</div>
-                        {message.sources?.length > 0 && (
-                            <div className="message-sources">
-                                {message.sources.map((source, i) => (
-                                    <span key={i}>
-                                        {source.source}
-                                        {source.page != null && ` · P${source.page}`}
-                                    </span>
-                                ))}
-                            </div>
-                        )}
+                {groups.map((group, groupIndex) => (
+                    <div className="chat-group-wrap" key={groupIndex}>
+                        <div
+                            className={`chat-group ${
+                                group.mode === "rag" ? "rag" : "ai"
+                            }`}
+                        >
+                            {group.items.map((message, index) => (
+                                <div
+                                    key={index}
+                                    className={`chat-message ${message.role}`}
+                                >
+                                    <div
+                                        className={`message-bubble${
+                                            message.streaming ? " streaming" : ""
+                                        }`}
+                                    >
+                                        {message.content ||
+                                            (message.streaming
+                                                ? "正在思考..."
+                                                : "")}
+                                    </div>
+                                    {message.sources?.length > 0 && (
+                                        <div className="message-sources">
+                                            {message.sources.map((source, i) => (
+                                                <span key={i}>
+                                                    {source.source}
+                                                    {source.page != null &&
+                                                        ` · P${source.page}`}
+                                                </span>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            ))}
+                        </div>
+                        <div className="chat-group-label">
+                            {group.mode === "rag" ? "论文检索" : "AI 对话"}
+                        </div>
                     </div>
                 ))}
-
-                {loading && (
-                    <div className="chat-message assistant">
-                        <div className="message-bubble loading-message">正在思考...</div>
-                    </div>
-                )}
 
                 {/* 用于自动滚动定位的空节点 */}
                 <div ref={messagesEndRef} />

@@ -9,6 +9,7 @@ import {
 import { Link, useNavigate, useLocation } from "react-router-dom";
 import { useEffect, useState, useRef } from "react";
 import SettingsDrawer from "./SettingsDrawer.js";
+import { subscribeSettings } from "../store/settingsStore.js";
 import ProfileDrawer from "./ProfileDrawer.js";
 import useClickOutside from "../hooks/useClickOutside.js";
 
@@ -38,6 +39,15 @@ export default function Header({ onUserMenuChange }) {
     useEffect(() => {
         onUserMenuChange?.(userMenuOpen);
     }, [userMenuOpen, onUserMenuChange]);
+
+    // 其它页面（如文件管理）可通过 settingsStore 打开设置抽屉并定位区块
+    useEffect(() => {
+        return subscribeSettings((section) => {
+            setSettingsTab(section || "api");
+            setSettingsOpen(true);
+            setUserMenuOpen(false);
+        });
+    }, []);
 
     function openSettings(tab) {
         setSettingsTab(tab);
@@ -85,10 +95,12 @@ export default function Header({ onUserMenuChange }) {
 
                 <div className="header-actions">
                     <button
-                        className="icon-button"
-                        onClick={() => openSettings("api")}
+                        className="icon-button settings-button"
+                        onClick={() => openSettings("model")}
+                        title="模型设置"
                     >
                         <Settings size={19} />
+                        <span>模型设置</span>
                     </button>
 
                     <div className="user-menu-wrapper" ref={userMenuRef}>

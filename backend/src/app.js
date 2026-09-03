@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const documentRoutes = require('./routes/documents');
 const qaRoutes = require('./routes/qa');
+const chatRoutes = require('./routes/chat');
 const configRoutes = require('./routes/config');
 const app = express();
 
@@ -23,6 +24,7 @@ app.get('/health', (req, res) => {
 
 app.use('/api/documents',documentRoutes);
 app.use('/api/qa',qaRoutes);
+app.use('/api/chat',chatRoutes);
 app.use('/api/config',configRoutes);
 
 const PORT = process.env.PORT || 3000;

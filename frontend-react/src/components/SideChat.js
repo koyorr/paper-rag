@@ -8,6 +8,8 @@ import ChatSession from "./ChatSession.js";
 export default function SideChat({
     mode,
     initialQuestion,
+    initialMessages = [],
+    onMessagesChange,
     onClose,
     onResize,
     resizeDisabled = false,
@@ -65,6 +67,8 @@ export default function SideChat({
             <ChatSession
                 initialMode={mode}
                 initialQuestion={initialQuestion}
+                initialMessages={initialMessages}
+                onMessagesChange={onMessagesChange}
                 onClose={onClose}
             />
         </aside>

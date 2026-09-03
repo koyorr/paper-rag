@@ -436,6 +436,7 @@ body {
     padding: 16px 18px 0;
 }
 
+.chat-side-btn,
 .chat-fullscreen-btn {
     display: flex;
     align-items: center;
@@ -451,12 +452,14 @@ body {
     transition: background .18s, color .18s, transform .12s, box-shadow .18s;
 }
 
+.chat-side-btn:hover,
 .chat-fullscreen-btn:hover {
     background: #edf6f1;
     color: #3f8162;
     transform: translateY(-1px);
 }
 
+.chat-side-btn:active,
 .chat-fullscreen-btn:active {
     transform: scale(.96);
 }
@@ -744,6 +747,21 @@ body {
 .profile-content-wrapper label input:focus{
     border-color: #74a98e;
     box-shadow: 0 0 0 3px rgba(74, 108, 247, 0.15);
+}
+
+/* Ollama 本地：API Key 输入框置灰禁用 */
+.settings-content input:disabled {
+    background: #f3f5f4;
+    color: #aab4ae;
+    cursor: not-allowed;
+    border-color: #e3e7e4;
+}
+
+.field-hint {
+    display: block;
+    font-size: 11px;
+    color: #9aa39d;
+    margin-top: 5px;
 }
 
 .primary-button {
@@ -1115,9 +1133,28 @@ body {
     max-width: 88%;
     padding: 10px 12px;
     font-size: 13px;
-    line-height: 1.65;
+    line-height: 1.75;
     border-radius: 12px;
     background: #f3f5f4;
+    /* 保留模型回答中的换行与段落 */
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+
+/* 流式输出气泡：思考中占位 + 打字光标 */
+.message-bubble.streaming {
+    color: #98a29c;
+}
+
+.message-bubble.streaming:empty::after {
+    content: "正在思考...";
+    animation: streaming-pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes streaming-pulse {
+    0%, 100% { opacity: .45; }
+    50% { opacity: 1; }
 }
 
 .chat-message.user .message-bubble {
@@ -1138,6 +1175,48 @@ body {
     background: #f1f4f2;
     color: #738077;
     font-size: 10px;
+}
+
+
+/* 聊天分组：连续相同类型的对话合并为一个底色框，框外右下角标注类型 */
+.chat-group-wrap {
+    margin-bottom: 22px;
+}
+
+.chat-group {
+    border-radius: 14px;
+    padding: 14px 14px 4px;
+    border: 1px solid transparent;
+}
+
+.chat-group.rag {
+    background: #f2f8f4;
+    border-color: #dfefe5;
+}
+
+.chat-group.ai {
+    background: #f4f6fb;
+    border-color: #e3e8f5;
+}
+
+.chat-group .chat-message:last-child {
+    margin-bottom: 10px;
+}
+
+.chat-group-label {
+    margin-top: 6px;
+    text-align: right;
+    font-size: 11px;
+    color: #98a29c;
+    letter-spacing: .5px;
+}
+
+.chat-group.rag + .chat-group-label {
+    color: #7fa58e;
+}
+
+.chat-group.ai + .chat-group-label {
+    color: #8d9ac0;
 }
 
 .chat-composer {
@@ -1312,6 +1391,104 @@ body {
     border-radius: 14px;
     padding: 24px;
     line-height: 1.8;
+}
+
+.search-result-card p {
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+
+/* 文件检索页：检索 / 问答模式切换 */
+.search-mode-tabs {
+    display: flex;
+    gap: 6px;
+    margin-top: 22px;
+}
+
+.search-mode-tabs button {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    border: 1px solid #e2e8e4;
+    background: transparent;
+    padding: 8px 16px;
+    border-radius: 10px;
+    font-size: 13px;
+    color: #5d6b64;
+    cursor: pointer;
+    transition: all .15s ease;
+}
+
+.search-mode-tabs button.active {
+    background: #edf6f1;
+    border-color: #bfd9cb;
+    color: #438466;
+    font-weight: 600;
+}
+
+/* 纯语义检索结果 */
+.search-result-card h3 {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 0 0 14px;
+}
+
+.result-count {
+    font-size: 12px;
+    font-weight: 500;
+    color: #8a948e;
+    background: #f1f4f2;
+    border-radius: 20px;
+    padding: 2px 10px;
+}
+
+.search-hit-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.search-hit {
+    border: 1px solid #e9edeb;
+    border-radius: 12px;
+    padding: 14px 16px;
+    background: #fbfcfb;
+}
+
+.search-hit-meta {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    color: #56826b;
+    font-size: 12px;
+    margin-bottom: 8px;
+}
+
+.search-hit-score {
+    margin-left: auto;
+    color: #8a948e;
+    background: #f1f4f2;
+    border-radius: 20px;
+    padding: 1px 8px;
+}
+
+.search-hit-content {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.8;
+    color: #3d463f;
+    white-space: pre-wrap;
+}
+
+.search-empty-tip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #8a948e;
+    font-size: 13px;
 }
 
 .source-row {
@@ -1789,6 +1966,45 @@ body {
 .file-table th:last-child,
 .file-table td:last-child {
     width: 180px;
+}
+
+
+/* 文件名可点击打开论文 */
+.file-name-link {
+    font-weight: 500;
+    color: #2f6d52;
+    text-decoration: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: color .15s;
+}
+
+.file-name-link:hover {
+    color: #1f9d68;
+    text-decoration: underline;
+}
+
+/* 表格复选框 */
+.file-checkbox {
+    width: 15px;
+    height: 15px;
+    accent-color: #468a69;
+    cursor: pointer;
+    vertical-align: middle;
+}
+
+/* 批量删除按钮（红色提示） */
+.toolbar-btn.batch-delete-btn {
+    color: #c0392b;
+    border-color: #f0c4bd;
+}
+
+.toolbar-btn.batch-delete-btn:hover:not(:disabled) {
+    color: #a93226;
+    border-color: #e8a89f;
+    background: #fdf3f1;
 }
 
 /* 文件名单元格 */
@@ -2651,4 +2867,136 @@ td:hover .error-tooltip {
     margin: 8px 0 0;
     font-size: 12px;
     color: #8a908d;
+}
+
+
+/* ==========================
+   模型设置抽屉：一屏展开分区
+========================== */
+
+.settings-section {
+    padding-bottom: 28px;
+    margin-bottom: 28px;
+    border-bottom: 1px solid #f0f2f5;
+    scroll-margin-top: 16px;
+}
+
+.settings-section:last-child {
+    padding-bottom: 0;
+    margin-bottom: 0;
+    border-bottom: none;
+}
+
+/* 头部「模型设置」按钮 */
+.icon-button.settings-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 14px;
+    color: #4a4e5a;
+}
+
+.icon-button.settings-button:hover {
+    color: #1a1c23;
+}
+
+/* 上传前置配置提示条 */
+.config-hint {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+    padding: 12px 16px;
+    border: 1px solid #f0d9a8;
+    border-radius: 12px;
+    background: #fff8e8;
+    color: #8a6420;
+    font-size: 14px;
+}
+
+.config-hint-btn {
+    margin-left: auto;
+    padding: 7px 14px;
+    border: none;
+    border-radius: 8px;
+    background: #468b68;
+    color: #fff;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.config-hint-btn:hover {
+    background: #3a7558;
+}
+
+
+/* ==========================
+   模型设置抽屉：模式切换 / API 区块 / 合并保存
+========================== */
+
+/* 共用 / 分别设置 API 切换 */
+.mode-toggle {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 18px;
+    padding: 4px;
+    border-radius: 12px;
+    background: #f2f4f6;
+    width: fit-content;
+}
+
+.mode-toggle button {
+    border: none;
+    background: transparent;
+    padding: 8px 14px;
+    border-radius: 9px;
+    font-size: 13px;
+    font-weight: 500;
+    color: #5b5f6b;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.mode-toggle button.active {
+    background: #ffffff;
+    color: #2c2e34;
+    font-weight: 600;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.08);
+}
+
+/* 分别设置模式下的 API 区块 */
+.api-block {
+    margin-bottom: 18px;
+    padding: 14px 16px;
+    border: 1px solid #e6ebe8;
+    border-radius: 12px;
+    background: #fafcfb;
+}
+
+.api-block-title {
+    margin: 0 0 12px 0;
+    font-size: 13px;
+    font-weight: 600;
+    color: #2c2e34;
+}
+
+/* 底部合并保存栏（吸底，始终可见） */
+.settings-footer {
+    position: sticky;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding: 16px 0 4px 0;
+    margin-top: 8px;
+    border-top: 1px solid #f0f2f5;
+    background: #ffffff;
+}
+
+.settings-footer .primary-button {
+    max-width: 160px;
 }

@@ -18,17 +18,52 @@ import Toast from "./components/Toast.js";
 import { subscribeToast } from "./store/toastStore.js";
 import "./styles/global.css";
 
+const SIDE_CHAT_KEY = "paperhub_side_chat";
+
+/** 读取本地保存的侧边聊天状态（open / mode / messages） */
+function loadSavedSideChat() {
+    try {
+        const raw = localStorage.getItem(SIDE_CHAT_KEY);
+        if (!raw) return null;
+        const data = JSON.parse(raw);
+        if (!data || !Array.isArray(data.messages)) return null;
+        return data;
+    } catch {
+        return null;
+    }
+}
+
 function AppContent() {
     // 判断当前是否在 /chat 页面
     const location = useLocation();
-    // useState 用于在函数组件中添加局部状态。
-    // 它返回一个数组 [state, setState]，调用 setState 会触发组件重新渲染
-    const [sideChat, setSideChat] = useState({
-        open: false,
-        mode: "rag",
-        question: "",
-        seed: 0,
+    // 侧边聊天：从本地恢复（刷新页面后不丢失打开的侧边聊天）
+    const [sideChat, setSideChat] = useState(() => {
+        const saved = loadSavedSideChat();
+        return {
+            open: saved?.open ?? false,
+            mode: saved?.mode ?? "rag",
+            question: "",
+            messages: saved?.messages ?? [],
+            seed: 0,
+        };
     });
+
+    // 侧边聊天状态变化时持久化到本地
+    useEffect(() => {
+        try {
+            localStorage.setItem(
+                SIDE_CHAT_KEY,
+                JSON.stringify({
+                    open: sideChat.open,
+                    mode: sideChat.mode,
+                    messages: sideChat.messages || [],
+                })
+            );
+        } catch {
+            /* 忽略 */
+        }
+    }, [sideChat.open, sideChat.mode, sideChat.messages]);
+
     // 右侧聊天面板宽度（可拖拽调整），默认与 CSS 中的 420px 一致
     const [sideChatWidth, setSideChatWidth] = useState(420);
     // 用户菜单是否打开（打开期间禁用右侧聊天面板拖拽）
@@ -38,14 +73,20 @@ function AppContent() {
     // 用于在函数组件中获取当前路径
     const isChatPage = location.pathname === "/chat";
 
-    // 打开聊天面板，重置 sideChat
+    // 打开聊天面板（保留已有会话消息，刷新/重开不丢失）
     function openSideChat({ mode, question }) {
-        setSideChat({
+        setSideChat((prev) => ({
             open: true,
             mode,
             question,
+            messages: prev.messages || [],
             seed: Date.now(),
-        });
+        }));
+    }
+
+    // 侧边聊天消息变化时回写 App 状态（用于持久化）
+    function handleSideMessagesChange(messages) {
+        setSideChat((prev) => ({ ...prev, messages }));
     }
     // 函数式更新（传入 prev 前一个状态）
     function closeSideChat() {
@@ -82,6 +123,8 @@ function AppContent() {
                         key={sideChat.seed}
                         mode={sideChat.mode}
                         initialQuestion={sideChat.question}
+                        initialMessages={sideChat.messages}
+                        onMessagesChange={handleSideMessagesChange}
                         onClose={closeSideChat}
                         onResize={setSideChatWidth}
                         resizeDisabled={userMenuOpen}
